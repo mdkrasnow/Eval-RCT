@@ -1,7 +1,7 @@
 # Full Protocol — Eval by SwiftScore: Pragmatic Hybrid Trial (Parallel CRT → Stepped Wedge)
 
 **Sponsor:** SwiftScore  
-**PI:** (to be assigned) · **Version:** 1.0 · **Date:** (fill)  
+**PI:** Matt Krasnow · **Version:** 1.0 · **Date:** 08/15/2025
 **Scope:** 50–200 schools, multi‑district, 6–18 months
 
 ---
