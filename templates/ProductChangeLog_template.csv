@@ -1,0 +1,2 @@
+date,version,feature_flag,description,rollout_scope,notes
+YYYY-MM-DD,vX.Y,flag_name,Short description,PhaseA/PhaseB/specific waves,
