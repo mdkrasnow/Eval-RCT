@@ -1,4 +1,7 @@
-# Eval by SwiftScore — Study Pack
+# Eval RCT
+
+## Notion:
+https://www.notion.so/Matched-Pairs-Eval-Study-25075584fbef80f8b210e0bc5c322769
 
 Contains:
 - `docs/proposal_outline.md` — high-level outline
