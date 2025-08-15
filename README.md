@@ -1,6 +1,6 @@
 # Eval by SwiftScore — Study Pack
 
-This ZIP contains:
+Contains:
 - `docs/proposal_outline.md` — high-level outline
 - `docs/full_proposal.md` — full protocol
 - `docs/randomization_compliance_SOP.md` — one-page SOP
