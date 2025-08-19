@@ -1,0 +1,10 @@
+*.aux
+*.out
+*.synctex
+*.toc
+*.log
+*.bbl
+*.blg
+*.synctex.gz
+*.synctex
+*.synctex(busy)

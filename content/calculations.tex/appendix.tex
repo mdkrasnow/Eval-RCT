@@ -1,0 +1,505 @@
+\documentclass[11pt]{article}
+
+% ---------- Packages ----------
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm, bm}
+\usepackage{booktabs, longtable, array, multirow}
+\usepackage{enumitem}
+\usepackage{siunitx}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue
+}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{inconsolata}
+
+% ---------- Macros ----------
+\newcommand{\TPG}{\mathrm{TPG}}
+\newcommand{\PPE}{\mathrm{PPE}}
+\newcommand{\RT}{\mathrm{RT}}
+\newcommand{\ERAI}{\mathrm{ERAI}}
+\newcommand{\PSI}{\mathrm{PSI}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\SE}{\mathrm{SE}}
+\newcommand{\logit}{\mathrm{logit}}
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\indep}{\perp\!\!\!\perp}
+
+\title{Technical Appendix: Metrics, Data Structures, and Estimation Procedures}
+\author{Matt Krasnow, Will Krasnow, Justin Lanzilotti}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\section*{Abstract}
+This appendix formally defines the data structures, variables, and statistical procedures used to compute all reported metrics. It covers (i) the relational record and JSON evaluation payload, (ii) derived variables required by the estimation procedures, and (iii) the exact formulas for all sub-metrics and composites: Teacher Professional Growth ($\TPG$), Principal Performance and Efficiency ($\PPE$), and Relational Trust ($\RT$). The document is written for academic advisors and statisticians and aims to be implementation-ready.
+
+\section{Notation}
+\begin{itemize}[leftmargin=2em]
+  \item Indices: teachers $i \in \{1,\dots,N_T\}$, evaluators/raters $j \in \{1,\dots,N_R\}$, components $k \in \mathcal{K}$, domains $d \in \mathcal{D}$, artifacts (evaluations) $a \in \{1,\dots,N_A\}$, time periods $t$.
+  \item Scores: component score $X_{i j k a} \in \mathbb{R}$ (ordinal/polytomous on a bounded scale); domain score $S_{i d a}$; recomputed overall score $S^{\mathrm{overall}}_{i a}$.
+  \item Rasch/MFRM parameters: teacher ability $\theta_i$, rater severity $\rho_j$, step thresholds $\beta_{k x}$ (category $x$ for component $k$), optional period effect $\tau_t$.
+  \item Timestamps: observation/creation $T^{\mathrm{obs}}_a$, draft start $T^{\mathrm{draft}}_a$, finalize $T^{\mathrm{final}}_a$, delivery/share $T^{\mathrm{deliv}}_a$.
+  \item Text: component summaries $Y_{k a}$, overall summary $Y^{\mathrm{overall}}_a$, low-inference notes $N_a$.
+  \item Operators: $\Var(\cdot)$, $\SE(\cdot)$, $\Phi(\cdot)$ standard normal CDF.
+\end{itemize}
+
+\section{Data Structures}
+
+\subsection{Relational Record (Evaluation Artifact)}
+Each evaluation artifact is a row with the following fields (logical names shown; actual column names may differ):
+\begin{longtable}{@{}p{0.28\linewidth}p{0.25\linewidth}p{0.41\linewidth}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Definition / Use} \\
+\midrule
+\endhead
+\texttt{id} & \texttt{bigint} & Unique artifact identifier. \\
+\texttt{created\_at} & \texttt{timestamptz} & Creation time; default proxy for observation time $T^{\mathrm{obs}}_a$. \\
+\texttt{updated\_at} & \texttt{timestamptz} & Last update time; used in latency derivations. \\
+\texttt{shared\_at} & \texttt{timestamptz} (nullable) & Delivery/share time; preferred for $T^{\mathrm{deliv}}_a$ if set. \\
+\texttt{evaluation\_id} & \texttt{uuid} & Logical evaluation/observation UID. \\
+\texttt{evaluator} & \texttt{uuid} & Evaluator/rater identifier $j$. \\
+\texttt{teacher\_id} & \texttt{uuid} (nullable) & Teacher identifier $i$. \\
+\texttt{teacher\_name} & \texttt{text} (nullable) & Teacher label (for human-readable reports). \\
+\texttt{school\_id} & \texttt{uuid} (nullable) & School identifier. \\
+\texttt{school\_name} & \texttt{text} (nullable) & School label. \\
+\texttt{organization\_id} & \texttt{uuid} (nullable) & Organization/district identifier. \\
+\texttt{framework\_id} & \texttt{text} & Instructional framework key. \\
+\texttt{evaluation} & \texttt{json} & JSON payload (Section \ref{sec:json}). \\
+\texttt{ai\_evaluation} & \texttt{jsonb} (nullable) & Optional AI generation/telemetry. \\
+\texttt{metadata} & \texttt{jsonb} (nullable) & Optional workflow metadata (timestamps, flags). \\
+\texttt{low\_inference\_notes} & \texttt{text} (nullable) & Raw evidence notes $N_a$. \\
+\texttt{additional\_comments} & \texttt{jsonb} (nullable) & Auxiliary comments (e.g., goals). \\
+\texttt{is\_shared} & \texttt{boolean} & Whether artifact was shared. \\
+\texttt{deleted\_at} & \texttt{timestamptz} (nullable) & Soft delete timestamp (exclude if set). \\
+\bottomrule
+\end{longtable}
+
+\subsection{Evaluation JSON Payload}\label{sec:json}
+The JSON conforms to the following schema:
+\begin{verbatim}
+Evaluation {
+  domains: { [domain_id: string]: DomainEvaluation },
+  metadata: EvaluationMetadata,
+  summary?: string,
+  summaryScores: SummaryScores
+}
+
+DomainEvaluation {
+  name: string,
+  components: { [component_id: string]: ComponentEvaluation },
+  weight: number,
+  isManuallyScored: boolean,
+  summary?: string,
+  domainScore: number
+}
+
+ComponentEvaluation {
+  score: number,
+  summary: string,
+  error?: string,
+  isManuallyScored: boolean,
+  modified?: boolean,
+  insufficientEvidence?: boolean,
+  teacherSummary?: string
+}
+
+SummaryScores {
+  overallScore: number,
+  domainWeights: { [domain_id: string]: number }
+}
+
+EvaluationMetadata {
+  framework_id: string,
+  framework_name: string
+}
+\end{verbatim}
+
+\subsection{Optional Metadata Keys (if present)}
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{metadata.observed\_at} (timestamptz): preferred $T^{\mathrm{obs}}_a$.
+  \item \texttt{metadata.draft\_started\_at}, \texttt{metadata.draft\_finalized\_at} (timestamptz): authoring interval.
+  \item \texttt{metadata.delivered\_to\_teacher\_at} (timestamptz): delivery time.
+  \item \texttt{metadata.is\_ai\_assisted} (bool): AI assist flag.
+  \item \texttt{metadata.source\_note\_ids[]} (array): linked evidence anchors.
+  \item \texttt{metadata.prior\_goal\_ids[]} (array): referenced coaching goals.
+  \item \texttt{metadata.token\_count}, \texttt{metadata.word\_count} (int).
+  \item \texttt{metadata.artifact\_type} (text): e.g., \emph{observation}, \emph{coaching}.
+\end{itemize}
+
+\section{Derived Variables and Defaults}
+\begin{align*}
+T^{\mathrm{obs}}_a &:= 
+\begin{cases}
+\texttt{metadata.observed\_at} & \text{if present}\\
+\texttt{created\_at} & \text{otherwise}
+\end{cases}\\[4pt]
+T^{\mathrm{deliv}}_a &:= 
+\begin{cases}
+\texttt{metadata.delivered\_to\_teacher\_at} & \text{if present}\\
+\texttt{shared\_at} & \text{else if present}\\
+\texttt{updated\_at} & \text{fallback}
+\end{cases}
+\end{align*}
+\noindent
+Word and token counts combine all component summaries and the optional overall summary:
+\[
+\text{Words}_a := \mathrm{wc}\bigl(Y^{\mathrm{overall}}_a \,\Vert\, \{Y_{k a}\}_k\bigr), \qquad
+\text{Tokens}_a := \mathrm{tc}\bigl(Y^{\mathrm{overall}}_a \,\Vert\, \{Y_{k a}\}_k\bigr).
+\]
+
+\section{Scoring and Re-aggregation}
+Let $w_d$ be the domain weight; $S_{i d a}$ the domain score for teacher $i$ in artifact $a$. The recomputed overall score is
+\begin{equation}
+S^{\mathrm{overall}}_{i a} = \sum_{d \in \mathcal{D}} w_d \, S_{i d a}, 
+\quad\text{where}\quad w_d =
+\begin{cases}
+\texttt{evaluation.summaryScores.domainWeights[d]} & \text{if provided}\\
+\texttt{evaluation.domains[d].weight} & \text{fallback}
+\end{cases}
+\end{equation}
+
+\section{Many-Facet Rasch Measurement (MFRM)}
+We use a partial-credit multi-facet model to estimate teacher ability ($\theta_i$), rater severity ($\rho_j$), and step thresholds ($\beta_{k x}$). For component $k$ with ordered categories $x=0,\dots,m_k-1$, define
+\begin{equation}
+\logit\, \Prob(X_{i j k a} \ge x) 
+= \theta_i - \rho_j - \beta_{k x} - \tau_{t(a)} ,
+\label{eq:mfrm}
+\end{equation}
+where $\tau_{t}$ is an optional period effect for time $t(a)$ determined by $T^{\mathrm{obs}}_a$. Estimation proceeds via joint/conditional maximum likelihood or marginal ML with appropriate identifiability constraints (e.g., sum-to-zero over facets).
+
+\subsection{Teacher Growth and Uncertainty}
+For teacher $i$, define baseline $T0$ and follow-up $T1$ windows. With person estimates $\widehat{\theta}_i(T0)$, $\widehat{\theta}_i(T1)$ and standard errors $\SE[\widehat{\theta}_i(T0)]$, $\SE[\widehat{\theta}_i(T1)]$:
+\begin{align}
+g_i &= \widehat{\theta}_i(T1) - \widehat{\theta}_i(T0),\\
+\SE(g_i) &= \sqrt{\SE^2[\widehat{\theta}_i(T1)] + \SE^2[\widehat{\theta}_i(T0)]},\\
+\mathrm{CI}_{95\%}(g_i) &= g_i \pm 1.96\, \SE(g_i).
+\end{align}
+Group growth aggregates via inverse-variance weighting:
+\begin{align}
+\bar{g} &= \frac{\sum_i w_i g_i}{\sum_i w_i}, \quad w_i := \SE(g_i)^{-2}, \qquad 
+\SE(\bar{g}) = \left(\sum_i w_i\right)^{-1/2}.
+\end{align}
+
+\subsection{Improvement Index (Percentile Translation)}
+Let $SD_{\mathrm{pre}}$ be the standard deviation of $\widehat{\theta}_i$ in the baseline window. Define standardized effect $d := g/SD_{\mathrm{pre}}$ and percentile translation
+\begin{equation}
+U3 = 100 \times \Phi(d).
+\end{equation}
+
+\section{Reliability}
+\subsection{Generalizability Theory (G-Study and D-Study)}
+With persons ($p$), raters ($r$), and occasions ($o$), random-effects ANOVA yields variance components $\sigma^2_p, \sigma^2_{pr}, \sigma^2_{po}, \sigma^2_{pro}$. For planned numbers of raters $n_r$ and occasions $n_o$, the relative G-coefficient is
+\begin{equation}
+G = \frac{\sigma^2_p}{\sigma^2_p + \sigma^2_{pr}/n_r + \sigma^2_{po}/n_o + \sigma^2_{pro}/(n_r n_o)}.
+\end{equation}
+The D-study solves for $(n_r, n_o)$ to achieve target $G$ (e.g., $G \ge 0.80$).
+
+\subsection{Rasch/MFRM Person Separation}
+From the MFRM, report person separation reliability ($\PSI$) for $\theta$ estimates and the number of distinguishable strata:
+\begin{equation}
+\text{Strata} \;=\; \frac{4 \times \text{Separation} + 1}{3}.
+\end{equation}
+
+\section{Fairness and Drift}
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Rater severity spread:} $\mathrm{SD}(\{\widehat{\rho}_j\}_j)$. Flag unusually wide spreads.
+  \item \textbf{Extremes:} $\max_j |\widehat{\rho}_j|$.
+  \item \textbf{Drift:} segment by month/quarter via $T^{\mathrm{obs}}_a$ and examine $\widehat{\rho}_j(t)$; apply control charts or re-fit time-sliced models. 
+  \item \textbf{Differential Rater Functioning (DRF):} test interactions of raters with subgroups (e.g., school/subject if available in metadata).
+\end{itemize}
+
+\section{Text-Based Validity, Alignment, and Tone}
+\subsection{Evidence-to-Rating Alignment Index ($\ERAI$)}
+For each component $k$:
+\begin{align}
+\mathrm{cit\_presence}_{k a} &\in \{0,1\} \quad\text{(regex over summaries/notes)}\\
+\mathrm{rubric\_sim}_{k a} &\in [0,1] \quad\text{(embedding cosine to rubric text)}\\
+\mathrm{entail}_{k a} &\in [0,1] \quad\text{(NLI: notes $\Rightarrow$ summary claims)}\\
+\mathrm{consist}_{k a} &\in [0,1] \quad\text{(text-inferred level vs.\ numeric score)}
+\end{align}
+Component-level alignment:
+\begin{equation}
+\ERAI_{k a} = \tfrac{1}{4}\bigl(\mathrm{cit\_presence}_{k a} + \mathrm{rubric\_sim}_{k a} + \mathrm{entail}_{k a} + \mathrm{consist}_{k a}\bigr).
+\end{equation}
+Artifact-level alignment averages valid components:
+\begin{equation}
+\ERAI_{a} = \frac{1}{|\mathcal{K}_a|}\sum_{k \in \mathcal{K}_a} \ERAI_{k a}, \quad \mathcal{K}_a := \{k: \text{not } \texttt{insufficientEvidence}\}.
+\end{equation}
+
+\subsection{Clarity of Expectations}
+Within artifact text (overall + components), compute
+\[
+\mathrm{clarity}_a = \mathbf{1}\{\text{time-bound}\} + \mathbf{1}\{\text{measurable}\} + \mathbf{1}\{\text{rubric-linked}\} \in \{0,1,2,3\}.
+\]
+
+\subsection{Relational Tone Signals}
+On concatenated text:
+\begin{align}
+\mathrm{affirm\_share}_a &= \frac{\#\text{affirming tokens}}{\text{Tokens}_a},\\
+\mathrm{praise\!:\!suggest}_a &= \frac{\#\text{praise sentences}}{\#\text{suggestion sentences}},\\
+\mathrm{we/you}_a &= \frac{\#\text{``we''}}{\#\text{``you''}},\\
+\mathrm{hedge\_rate}_a &= 1000 \times \frac{\#\text{hedges}}{\text{Tokens}_a},\\
+\mathrm{follow\_through}_a &\in \{0,1\}\quad \text{(references to prior goals)}.
+\end{align}
+
+\subsection{Topic Alignment (School-Level)}
+Let $\bm{\pi}^{(\mathrm{FG})}$ be the topic distribution from teacher focus groups and $\bm{\pi}^{(\mathrm{FB})}$ from principal feedback text. Define
+\begin{equation}
+\mathrm{topic\_align} = \frac{\bm{\pi}^{(\mathrm{FG})} \cdot \bm{\pi}^{(\mathrm{FB})}}{\|\bm{\pi}^{(\mathrm{FG})}\|_2 \, \|\bm{\pi}^{(\mathrm{FB})}\|_2} \in [0,1].
+\end{equation}
+
+\section{Time, Throughput, and Pipeline}
+\subsection{Authoring Time and Latency}
+\begin{align}
+\mathrm{authoring\_minutes}_a &=
+\begin{cases}
+\bigl(T^{\mathrm{final}}_a - T^{\mathrm{draft}}_a\bigr) / 60 & \text{if both present}\\
+\text{N/A} & \text{otherwise}
+\end{cases}\\[4pt]
+\mathrm{latency\_days}_a &= \bigl(T^{\mathrm{deliv}}_a - T^{\mathrm{obs}}_a\bigr) / 86400.
+\end{align}
+
+\subsection{Throughput, Coverage, Streak}
+Let month $m(a) := \mathrm{date\_trunc}(\mathrm{month}, T^{\mathrm{deliv}}_a)$ (or $T^{\mathrm{obs}}_a$ if delivery not used).
+\begin{align}
+\mathrm{throughput}_{j m} &= \#\{a: \text{evaluator } j,\, m(a)=m\},\\
+\mathrm{coverage}_{s m} &= \frac{\#\{\text{distinct } i \text{ at school } s \text{ with } \ge 1 \text{ artifact in } m\}}{\text{teacher roster size at } s \text{ in } m},\\
+\mathrm{streak}_i &= \max \text{ run length of consecutive months with } \ge 1 \text{ artifact for } i.
+\end{align}
+
+\subsection{Pipeline Efficiency}
+\begin{align}
+\mathrm{converted\_7d\_rate} &= \frac{\#\{a: T^{\mathrm{deliv}}_a - T^{\mathrm{obs}}_a \le 7 \text{ days}\}}{\#\{a\}},\\
+\mathrm{edits\_to\_final}_a &\approx \sum_{k \in \mathcal{K}_a} \mathbf{1}\{\texttt{modified}= \text{true}\} \quad \text{(proxy if version logs absent)}.
+\end{align}
+
+\section{Coaching and Goals}
+\begin{align}
+\mathrm{coaching\_per\_teacher\_term} &= \frac{\#\{\text{coaching artifacts for teacher in term}\}}{\text{term length}},\\
+\mathrm{goals\_set\_per\_teacher} &= \#\{\text{new goal identifiers in term}\},\\
+\mathrm{SMART\_score} &\in \{0,\dots,5\}\ \text{(presence of S/M/A/R/T attributes via rules/classifier)}.
+\end{align}
+
+\section{AI-Assist Utilization and Effect (if logged)}
+\begin{align}
+\mathrm{utilization\_rate} &= \E[\mathbf{1}\{\texttt{is\_ai\_assisted}\}],\\
+\Delta \mathrm{time} &= \mathrm{median}\bigl(\mathrm{authoring\_minutes}\mid \mathrm{assisted}\bigr) - 
+\mathrm{median}\bigl(\mathrm{authoring\_minutes}\mid \text{matched non-assisted}\bigr),
+\end{align}
+where matching controls for \emph{text length} (words/tokens) and \emph{component coverage} within evaluator $j$. Report Hodges--Lehmann estimate and Wilcoxon $p$-value.
+
+\section{Focus Groups and Surveys}
+\subsection{Trust Index}
+Code focus-group transcripts for \emph{respect}, \emph{competence}, \emph{integrity}, and \emph{personal regard}. With intensity $c \in \{0,1,2\}$ for each coded occurrence and $C_{\max}$ the maximum possible per participant:
+\begin{equation}
+\RT_{\mathrm{FG}} = \frac{\sum \text{code intensities}}{C_{\max} \times \#\text{participants}}.
+\end{equation}
+Report teacher and principal indices separately and their alignment gap.
+
+\subsection{Usability and Workload}
+Compute standard SUS (0--100) on the 10-item instrument and optional NASA-TLX workload composites for the authoring task.
+
+\section{Comparative Designs}
+\subsection{Matched Rollout \& Difference-in-Differences}
+For outcome $Y_{s t}$ (e.g., school-level mean $\widehat{\theta}$ or latency), let $D_{s t}$ indicate adoption. Estimate
+\begin{equation}
+Y_{s t} = \alpha_s + \gamma_t + \delta \cdot D_{s t} + \bm{X}_{s t}^\top \bm{\beta} + \varepsilon_{s t},
+\end{equation}
+with school fixed effects $\alpha_s$, period fixed effects $\gamma_t$, robust SEs clustered by school. For staggered adoption, use group-time average treatment effects (e.g., Callaway--Sant'Anna estimators) and event-study pre-trend checks.
+
+\subsection{Stepped-Wedge (Non-Random or Randomized)}
+Fit a mixed model with period fixed effects and cluster (school) random intercepts; report ITT effects, intra-class correlation (ICC), and pertinent sensitivity analyses.
+
+\section{Composite Indices as 0-Based Difference Scores}
+\label{sec:diff-composites}
+Composites are defined as weighted sums of \emph{natural-unit} differences from a pre-specified baseline, centered at 0 so that positive values indicate improvement and negatives indicate decline. No $z$-score standardization or percentage rescaling is used.
+
+\subsection{Baselines and Orientation}
+Let $b$ index the baseline window (e.g., pre-period) or control condition, and $t$ the follow-up window for a given reporting unit (teacher, evaluator, or school as appropriate). For each sub-metric $M$ we compute
+\begin{equation}
+\Delta M := \bar{M}_{t} - \bar{M}_{b},
+\end{equation}
+with direction aligned so that higher is better. For ``lower-is-better'' metrics (e.g., authoring minutes, latency), use $\Delta M := -\bigl(\bar{M}_{t} - \bar{M}_{b}\bigr)$.
+
+\paragraph{Unit scales.} To place heterogeneous natural units on a comparable contribution scale while preserving interpretability, each sub-metric has a fixed, pre-specified \emph{unit scale} $u_M$ (not estimated from the data). The scaled difference is $\Delta M / u_M$, where one unit corresponds to a meaningful change (e.g., $u_{\text{authoring}}=10$ minutes, $u_{\text{latency}}=1$ day, $u_{\text{throughput}}=1$ artifact/month, $u_{\ERAI}=0.05$ absolute, $u_{g}=0.10$ logits). Chosen $u_M$ values should be pre-registered and held constant across reports.
+
+\subsection{TPG — Teacher Professional Growth}
+Primary construct is growth in rater-adjusted latent performance, supplemented by validity and reliability guardrails. Define
+\begin{align}
+\Delta g &:= \bar{g}_{t} - \bar{g}_{b} \quad \text{(logits; already oriented)} ,\\
+\Delta \ERAI &:= \overline{\ERAI}_{t} - \overline{\ERAI}_{b},\\
+\Delta \text{Reliability} &:= \overline{\PSI}_{t} - \overline{\PSI}_{b},\\
+\Delta \text{Fairness} &:= -\,\Bigl(\mathrm{SD}(\{\widehat{\rho}_j\})_{t} - \mathrm{SD}(\{\widehat{\rho}_j\})_{b}\Bigr),\\
+\Delta \text{FG growth} &:= \overline{\text{FG growth index}}_{t} - \overline{\text{FG growth index}}_{b}.
+\end{align}
+With weights $\bm{w}^{(\TPG)}$ (summing to 1) and unit scales $u_M$, the composite is
+\begin{equation}
+\TPG \;=\; \sum_{M \in \{g,\ERAI,\text{Reliability},\text{Fairness},\text{FG growth}\}} w^{(\TPG)}_M \cdot \frac{\Delta M}{u_M} .
+\end{equation}
+Recommended default emphasizes growth: $w^{(\TPG)}_g=0.6$, others share the remainder unless pre-registered otherwise.
+
+\subsection{PPE — Principal Performance and Efficiency}
+Define oriented differences for key efficiency and production metrics:
+\begin{align}
+\Delta \text{authoring} &:= -\bigl(\overline{\text{authoring\_minutes}}_{t} - \overline{\text{authoring\_minutes}}_{b}\bigr),\\
+\Delta \text{latency} &:= -\bigl(\overline{\text{latency\_days}}_{t} - \overline{\text{latency\_days}}_{b}\bigr),\\
+\Delta \text{throughput} &:= \overline{\text{artifacts/leader/month}}_{t} - \overline{\text{artifacts/leader/month}}_{b},\\
+\Delta \text{coverage} &:= \overline{\%\,\text{teachers with $\ge 1$ artifact/month}}_{t} - \overline{\%\,\text{teachers with $\ge 1$ artifact/month}}_{b},\\
+\Delta \text{content} &:= \overline{\text{content richness index}}_{t} - \overline{\text{content richness index}}_{b},\\
+\Delta \text{pipeline} &:= \overline{\text{converted\_7d\_rate}}_{t} - \overline{\text{converted\_7d\_rate}}_{b} .
+\end{align}
+Composite:
+\begin{equation}
+\PPE \;=\; \sum_{M \in \{\text{authoring},\text{latency},\text{throughput},\text{coverage},\text{content},\text{pipeline}\}} w^{(\PPE)}_M \cdot \frac{\Delta M}{u_M} , \quad \sum_M w^{(\PPE)}_M=1.
+\end{equation}
+Recommended default emphasizes time saved and latency: $w^{(\PPE)}_{\text{authoring}}=0.35$, $w^{(\PPE)}_{\text{latency}}=0.25$, remaining weight distributed over production/quality metrics.
+
+\subsection{RT — Relational Trust}
+Define oriented differences:
+\begin{align}
+\Delta \RT_{\mathrm{FG}} &:= \overline{\RT_{\mathrm{FG}}}_{t} - \overline{\RT_{\mathrm{FG}}}_{b},\\
+\Delta \text{Tone} &:= \overline{\text{Relational Tone Index}}_{t} - \overline{\text{Relational Tone Index}}_{b},\\
+\Delta \text{Clarity} &:= \overline{\text{clarity}}_{t} - \overline{\text{clarity}}_{b},\\
+\Delta \text{TopicAlign} &:= \overline{\text{topic\_align}}_{t} - \overline{\text{topic\_align}}_{b} .
+\end{align}
+Composite:
+\begin{equation}
+\RT \;=\; \sum_{M \in \{\RT_{\mathrm{FG}},\text{Tone},\text{Clarity},\text{TopicAlign}\}} w^{(\RT)}_M \cdot \frac{\Delta M}{u_M} , \quad \sum_M w^{(\RT)}_M=1.
+\end{equation}
+Recommended default emphasizes focus-group trust: $w^{(\RT)}_{\RT_{\mathrm{FG}}}=0.5$.
+
+\subsection{Uncertainty and Reporting}
+Report point estimates of each $\Delta M$ in natural units alongside the composite. Compute composite confidence intervals via nonparametric bootstrap over teachers ($\TPG$,$\RT$) or evaluators ($\PPE$), maintaining the weighting and unit scales within each replicate.
+
+\section{Data Quality \& Missingness}
+\begin{itemize}[leftmargin=2em]
+  \item Exclude artifacts with \texttt{deleted\_at} \,not null.
+  \item Prefer $T^{\mathrm{obs}}_a$ from metadata; otherwise use \texttt{created\_at}.
+  \item If delivery is unlogged, use \texttt{shared\_at} then \texttt{updated\_at} for $T^{\mathrm{deliv}}_a$.
+  \item Report coverage (\%) for each metric and apply pairwise deletion by default; consider multiple imputation for time-series analyses if MAR is plausible.
+\end{itemize}
+
+\appendix
+
+\section{Field Dictionary: Definitions, Types, and Calculations}
+\subsection*{Identity \& Linkage}
+\begin{longtable}{@{}p{0.28\linewidth}p{0.18\linewidth}p{0.46\linewidth}@{}}
+\toprule
+\textbf{Name} & \textbf{Type} & \textbf{Definition / Calculation} \\
+\midrule
+\endhead
+\texttt{id} & bigint & Artifact identifier. \\
+\texttt{evaluation\_id} & uuid & Observation UID. \\
+\texttt{teacher\_id}, \texttt{teacher\_name} & uuid, text & Teacher key/label ($i$). \\
+\texttt{evaluator} & uuid & Evaluator/rater key ($j$). \\
+\texttt{school\_id}, \texttt{school\_name} & uuid, text & School key/label. \\
+\texttt{organization\_id} & uuid & Organization/district key. \\
+\texttt{framework\_id} & text & Instructional framework key. \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Timestamps}
+\begin{longtable}{@{}p{0.28\linewidth}p{0.18\linewidth}p{0.46\linewidth}@{}}
+\toprule
+\textbf{Name} & \textbf{Type} & \textbf{Definition / Calculation} \\
+\midrule
+\endhead
+\texttt{created\_at} & timestamptz & Default $T^{\mathrm{obs}}_a$ if metadata absent. \\
+\texttt{updated\_at} & timestamptz & Used in latency fallback. \\
+\texttt{shared\_at} & timestamptz & Preferred $T^{\mathrm{deliv}}_a$ if set. \\
+\texttt{metadata.observed\_at} & timestamptz & Preferred observation time. \\
+\texttt{metadata.draft\_started\_at} & timestamptz & Authoring start (if present). \\
+\texttt{metadata.draft\_finalized\_at} & timestamptz & Authoring end (if present). \\
+\texttt{metadata.delivered\_to\_teacher\_at} & timestamptz & Delivery time (if present). \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Scores \& Text}
+\begin{longtable}{@{}p{0.28\linewidth}p{0.18\linewidth}p{0.46\linewidth}@{}}
+\toprule
+\textbf{Name} & \textbf{Type} & \textbf{Definition / Calculation} \\
+\midrule
+\endhead
+\texttt{domains[d].domainScore} & number & Domain score $S_{i d a}$. \\
+\texttt{domains[d].weight} & number & Domain weight $w_d$ (fallback). \\
+\texttt{summaryScores.domainWeights[d]} & number & Preferred $w_d$. \\
+\texttt{components[k].score} & number & Component score $X_{i j k a}$. \\
+\texttt{components[k].summary} & string & Text $Y_{k a}$. \\
+\texttt{summary} & string & Overall text $Y^{\mathrm{overall}}_a$. \\
+\texttt{summaryScores.overallScore} & number & Provided overall score (audited vs.\ recompute). \\
+\texttt{low\_inference\_notes} & string & Evidence text $N_a$. \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Flags \& Links}
+\begin{longtable}{@{}p{0.28\linewidth}p{0.18\linewidth}p{0.46\linewidth}@{}}
+\toprule
+\textbf{Name} & \textbf{Type} & \textbf{Definition / Calculation} \\
+\midrule
+\endhead
+\texttt{components[k].isManuallyScored} & bool & Manual scoring flag. \\
+\texttt{components[k].modified} & bool & Edited post-generation. \\
+\texttt{components[k].insufficientEvidence} & bool & Evidence insufficient. \\
+\texttt{metadata.is\_ai\_assisted} & bool & AI assist used. \\
+\texttt{metadata.source\_note\_ids[]} & array & Evidence anchors. \\
+\texttt{metadata.prior\_goal\_ids[]} & array & Goal references. \\
+\bottomrule
+\end{longtable}
+
+\subsection*{Derived Quantities}
+\begin{longtable}{@{}p{0.32\linewidth}p{0.50\linewidth}@{}}
+\toprule
+\textbf{Name} & \textbf{Definition / Formula} \\
+\midrule
+\endhead
+$S^{\mathrm{overall}}_{i a}$ & $\sum_d w_d S_{i d a}$ \\
+Words, Tokens & Counts over $Y^{\mathrm{overall}}_a \Vert \{Y_{k a}\}$ \\
+Evidence density & $(\#\text{citations}) / \text{Words} \times 100$ \\
+Authoring minutes & $(T^{\mathrm{final}}_a - T^{\mathrm{draft}}_a)/60$ (if present) \\
+Latency days & $(T^{\mathrm{deliv}}_a - T^{\mathrm{obs}}_a)/86400$ \\
+Throughput & $\#\text{artifacts per evaluator-month}$ \\
+Coverage & $\%\text{teachers with }\ge 1 \text{ artifact per month}$ \\
+Streak & Longest consecutive months with $\ge 1$ artifact \\
+\bottomrule
+\end{longtable}
+
+\section{Estimation Outputs (Summary)}
+\begin{longtable}{@{}p{0.32\linewidth}p{0.50\linewidth}@{}}
+\toprule
+\textbf{Quantity} & \textbf{Definition / Estimation} \\
+\midrule
+\endhead
+$\widehat{\theta}_i$ & Teacher ability (logits) from MFRM. \\
+$\widehat{\rho}_j$ & Rater severity (logits) from MFRM. \\
+$\widehat{\beta}_{k x}$ & Step thresholds from MFRM. \\
+$g_i$, $\bar{g}$ & Teacher growth and group mean; CIs via delta method. \\
+$U3$ & Percentile translation $100\Phi(g/SD_{\mathrm{pre}})$. \\
+$G$ & Generalizability coefficient; D-study recommendations. \\
+$\PSI$, Strata & Person separation and distinguishable strata. \\
+$\ERAI$ & Evidence-to-rating alignment index (0--1). \\
+Tone/Clarity & Affirm share, praise:suggest, we/you, hedging, clarity (0--3). \\
+Topic alignment & Cosine similarity of topic distributions (0--1). \\
+\bottomrule
+\end{longtable}
+
+\section{Implementation Notes}
+\begin{itemize}[leftmargin=2em]
+  \item All time deltas are computed in seconds and rescaled (\si{\minute}, \si{\day}).
+  \item When delivery time is not explicitly recorded, use \texttt{shared\_at}, else \texttt{updated\_at}.
+  \item For matched comparisons (AI effect), match within evaluator on word count and component coverage.
+  \item Bootstrap CIs: 2000 replicates by teacher for $\TPG$/$\RT$ and by evaluator for $\PPE$.
+  \item Exclude artifacts with \texttt{deleted\_at} not null from all analyses.
+\end{itemize}
+
+\end{document}
