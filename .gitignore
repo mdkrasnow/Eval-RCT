@@ -8,3 +8,4 @@
 *.synctex.gz
 *.synctex
 *.synctex(busy)
+*.fdb_latexmk
